@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""trader-cryptogold/plan.py - offline planner for BTC, ETH and XAUUSD.
+
+Standard library only. It never touches the network and never places an order.
+You give it prices (read from a chart); it does the arithmetic.
+
+  python3 plan.py sessions
+  python3 plan.py range  --high 67500 --low 67100 --side both --rr 1.5
+  python3 plan.py size   --asset btc --side long --entry 67510 --stop 67300 \
+                         --rr 1.5 --account 500 --risk 5
+"""
+import argparse
+import math
+import sys
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # very old Python
+    ZoneInfo = None
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# step = smallest tradable size, contract = units of the underlying per 1.0 size
+ASSETS = {
+    "btc": dict(name="BTC/USD", step=0.00001, contract=1.0, unit="BTC",
+                fee_entry=0.05, fee_target=0.02, fee_stop=0.05,
+                spread=0.0, min_stop_pct=0.30, quote="USD"),
+    "eth": dict(name="ETH/USD", step=0.0001, contract=1.0, unit="ETH",
+                fee_entry=0.05, fee_target=0.02, fee_stop=0.05,
+                spread=0.0, min_stop_pct=0.40, quote="USD"),
+    # 1 lot = 100 oz, so a $1 move = $100 per lot; 0.01 lot = 1 oz
+    "xau": dict(name="XAU/USD", step=0.01, contract=100.0, unit="lots",
+                fee_entry=0.01, fee_target=0.01, fee_stop=0.01,
+                spread=0.30, min_stop_pct=0.10, quote="USDT"),
+}
+
+
+def floor_to(x, step):
+    return math.floor(x / step + 1e-9) * step
+
+
+QUOTE = "USD"  # set per asset inside cmd_size (BTC/ETH: USD, gold: USDT)
+
+
+def money(x):
+    return f"{x:,.2f} {QUOTE}"
+
+
+# ------------------------------------------------------------------ sessions
+def tz(name, fallback_hours):
+    if ZoneInfo:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return timezone(timedelta(hours=fallback_hours))
+
+
+def cmd_sessions(_a):
+    now = datetime.now(IST)
+    london, ny = tz("Europe/London", 0), tz("America/New_York", -5)
+    today_utc = datetime.now(timezone.utc).date()
+
+    def at(d, h, m, zone):
+        return datetime(d.year, d.month, d.day, h, m, tzinfo=zone)
+
+    rows = []
+    for off in (0, 1):
+        d = today_utc + timedelta(days=off)
+        rows += [
+            (at(d, 0, 0, timezone.utc), "UTC day open (daily candle resets)"),
+            (at(d, 8, 0, timezone.utc), "Perp funding 08:00 UTC"),
+            (at(d, 16, 0, timezone.utc), "Perp funding 16:00 UTC"),
+            (at(d, 8, 0, london), "London open (gold's busiest hours begin)"),
+            (at(d, 8, 30, ny), "US data time (CPI, NFP, jobless claims)"),
+            (at(d, 9, 30, ny), "US stock open (BTC/ETH often move here)"),
+            (at(d, 16, 0, ny), "US stock close"),
+            (at(d, 17, 0, ny), "Gold daily break starts (broker-specific)"),
+        ]
+    rows = [(t, s) for t, s in rows if t > now - timedelta(hours=1)]
+    rows.sort()
+    print(f"Now: {now:%a %d %b %H:%M} IST (all times below are IST)\n")
+    for t, s in rows[:14]:
+        mins = int((t - now).total_seconds() // 60)
+        when = f"in {mins // 60}h{mins % 60:02d}m" if mins >= 0 else "just passed"
+        wk = t.astimezone(IST)
+        print(f"  {wk:%a %H:%M}  {when:>10}  {s}")
+    print("\nWeekend: BTC/ETH trade 24/7 but thin. Gold closes Fri ~17:00 New York"
+          " and reopens Sun ~17:00 New York (check your broker).")
+
+
+# --------------------------------------------------------------------- range
+def cmd_range(a):
+    hi, lo = a.high, a.low
+    if hi <= lo:
+        sys.exit("range: high must be above low")
+    mid = round((hi + lo) / 2, 2)
+    print(f"Range {lo} - {hi}  (width {hi - lo:.2f}, mid {mid})")
+    print("Trigger = first 5-minute candle that CLOSES beyond the range, not a wick.\n")
+    if a.side in ("long", "both"):
+        e = hi
+        s = lo if a.stop == "low" else mid
+        r = e - s
+        print(f"LONG  entry > {e}  stop {s}  risk/unit {r:.2f}  target {e + a.rr * r:.2f} ({a.rr}R)")
+    if a.side in ("short", "both"):
+        e = lo
+        s = hi if a.stop == "low" else mid
+        r = s - e
+        print(f"SHORT entry < {e}  stop {s}  risk/unit {r:.2f}  target {e - a.rr * r:.2f} ({a.rr}R)")
+    print("\nNext: run `size` with the real fill price once a candle has closed beyond the range.")
+
+
+# ---------------------------------------------------------------------- size
+def cmd_size(a):
+    global QUOTE
+    A = ASSETS[a.asset]
+    QUOTE = a.quote or A["quote"]
+    long_ = a.side == "long"
+    e, s = a.entry, a.stop
+    stop_dist = e - s if long_ else s - e
+    if stop_dist <= 0:
+        sys.exit(f"REFUSED: a {a.side} stop must be {'below' if long_ else 'above'} the entry.")
+    if a.target is not None:
+        tgt = a.target
+        tgt_dist = tgt - e if long_ else e - tgt
+        if tgt_dist <= 0:
+            sys.exit("REFUSED: target is on the wrong side of the entry.")
+    else:
+        tgt_dist = a.rr * stop_dist
+        tgt = e + tgt_dist if long_ else e - tgt_dist
+
+    spread = A["spread"] if a.spread is None else a.spread
+    # fees in percent of notional, per side. --fee-pct sets all three at once.
+    base = a.fee_pct
+    fe = a.fee_entry if a.fee_entry is not None else (base if base is not None else A["fee_entry"])
+    ft = a.fee_target if a.fee_target is not None else (base if base is not None else A["fee_target"])
+    fs = a.fee_stop if a.fee_stop is not None else (base if base is not None else A["fee_stop"])
+    warns = []
+    stop_pct = stop_dist / e * 100
+    if stop_pct < A["min_stop_pct"]:
+        warns.append(f"stop is only {stop_pct:.2f}% away (< {A['min_stop_pct']}%): normal noise can hit it")
+    if spread and stop_dist < 3 * spread:
+        warns.append(f"stop is under 3x the spread ({spread}): you start the trade already near it")
+
+    # cost of a round trip, per 1.0 size: entry fee + exit fee (target or stop) + spread
+    notional_per = e * A["contract"]
+    fixed = spread * A["contract"] + a.commission
+    cost_loss = notional_per * (fe + fs) / 100 + fixed
+    cost_gain = notional_per * (fe + ft) / 100 + fixed
+    loss_per = stop_dist * A["contract"] + cost_loss
+    gain_per = tgt_dist * A["contract"] - cost_gain
+
+    size = a.risk / loss_per
+    decided = "max loss per trade"
+    max_lev = a.max_leverage
+    cap = a.account * max_lev / (e * A["contract"])
+    if size > cap:
+        size, decided = cap, f"leverage cap {max_lev:g}x"
+    size = floor_to(size, A["step"])
+    if size < A["step"]:
+        min_lev = A["step"] * A["contract"] * e / a.account
+        min_loss = A["step"] * loss_per
+        if decided.startswith("leverage"):
+            sys.exit(f"REFUSED: the smallest size ({A['step']} {A['unit']}) is worth "
+                     f"{money(A['step'] * A['contract'] * e)} = {min_lev:.1f}x your account, "
+                     f"above your {max_lev:g}x cap. Add funds, or raise --max-leverage "
+                     f"(more leverage = a bigger chance of a blown account).")
+        sys.exit(f"REFUSED: the smallest size ({A['step']} {A['unit']}) would lose "
+                 f"{money(min_loss)} at this stop, more than your {money(a.risk)} limit. "
+                 f"Use a tighter stop or accept a bigger loss limit.")
+
+    notional = size * A["contract"] * e
+    lev = notional / a.account
+    real_loss, real_gain = size * loss_per, size * gain_per
+    if lev > 5:
+        warns.append(f"leverage {lev:.1f}x is high: a gap or fast move can slip past your stop")
+    if cost_loss * size > 0.2 * a.risk:
+        warns.append(f"costs are {cost_loss * size / a.risk:.0%} of your risk: edge shrinks fast")
+    if a.risk > 0.02 * a.account:
+        warns.append(f"risk is {a.risk / a.account:.1%} of the account (rule of thumb: 1-2% max)")
+
+    print(f"{A['name'].split('/')[0]}/{QUOTE}  {a.side.upper()}  entry {e}  stop {s}  target {tgt:.2f}")
+    print(f"  size            {size:g} {A['unit']}   (limited by: {decided})")
+    print(f"  notional        {money(notional)}  = {lev:.2f}x your {money(a.account)}")
+    print(f"  loss at stop    {money(real_loss)}  (incl. costs)   <- most you should lose")
+    print(f"  gain at target  {money(real_gain)}  (after costs)")
+    print(f"  reward:risk     {tgt_dist / stop_dist:.2f} gross, {real_gain / real_loss:.2f} net")
+    print(f"  break-even win rate  {real_loss / (real_loss + real_gain):.0%}  (win more often than this to profit)")
+    if A["unit"] == "lots":
+        print(f"  = {size * 100:g} oz;  $1 move = {money(size * 100)}")
+    for w in warns:
+        print(f"  WARNING: {w}")
+    print("\nA stop is a plan, not a guarantee: news spikes and weekend gaps can fill past it.")
+    print("Nothing was placed. This is arithmetic, not advice.")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("sessions", help="key market times in IST").set_defaults(fn=cmd_sessions)
+
+    r = sub.add_parser("range", help="breakout levels from a session range")
+    r.add_argument("--high", type=float, required=True)
+    r.add_argument("--low", type=float, required=True)
+    r.add_argument("--side", choices=["long", "short", "both"], default="both")
+    r.add_argument("--stop", choices=["mid", "low"], default="mid", help="stop at range midpoint (default) or far side")
+    r.add_argument("--rr", type=float, default=1.0)
+    r.set_defaults(fn=cmd_range)
+
+    z = sub.add_parser("size", help="position size from entry, stop and your max loss")
+    z.add_argument("--asset", choices=sorted(ASSETS), required=True)
+    z.add_argument("--side", choices=["long", "short"], required=True)
+    z.add_argument("--entry", type=float, required=True)
+    z.add_argument("--stop", type=float, required=True)
+    z.add_argument("--target", type=float)
+    z.add_argument("--rr", type=float, default=1.5, help="used when --target is not given")
+    z.add_argument("--account", type=float, required=True, help="account size in the quote currency (USDT)")
+    z.add_argument("--risk", type=float, required=True, help="max loss per trade in the quote currency")
+    z.add_argument("--quote", default=None, help="settlement currency label (default: USD for BTC/ETH, USDT for gold)")
+    z.add_argument("--max-leverage", type=float, default=3.0)
+    z.add_argument("--spread", type=float, help="price units; default 0.30 for gold")
+    z.add_argument("--fee-pct", type=float, help="percent per side; sets entry, target and stop fees at once")
+    z.add_argument("--fee-entry", type=float, help="percent; default taker (0.05 crypto, 0.01 gold)")
+    z.add_argument("--fee-target", type=float, help="percent; default maker (0.02 crypto, 0.01 gold)")
+    z.add_argument("--fee-stop", type=float, help="percent; default taker (0.05 crypto, 0.01 gold)")
+    z.add_argument("--commission", type=float, default=0.0, help="gold: round-trip $ per lot")
+    z.set_defaults(fn=cmd_size)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
