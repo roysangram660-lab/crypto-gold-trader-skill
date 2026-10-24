@@ -1,0 +1,87 @@
+---
+name: trader-cryptogold
+description: >-
+  Crypto and Gold Day Trader. The day-trader pack rebuilt for BTC, ETH and
+  XAUUSD: 24/7 or near-24/7 markets, session ranges instead of the NYSE
+  opening bell, long AND short, sizing in coins or gold lots, IST times, and
+  a hard max loss per trade. Works from prices you read off a chart (or that
+  Claude looks up), with an offline calculator (plan.py) for sessions, range
+  breakout levels and position size. Never places an order. Use when the user
+  says "BTC", "ETH", "bitcoin", "ethereum", "gold", "XAUUSD", "crypto trade",
+  "size this trade", "where is my stop", "session range", "London open",
+  "plan my trade", or asks to adapt the trader skills to crypto or gold.
+---
+
+# Crypto + Gold Day Trader (BTC, ETH, XAUUSD)
+
+Method first, calculator second. Live prices come from the Alpha Vantage
+connector when it is loaded (see "Live data" below); the sandbox itself cannot
+reach exchanges. Candles for the session range come from the user's chart.
+Paper trade first. Not financial advice.
+
+## What changes vs the stock pack
+
+| Stock pack | Here |
+|---|---|
+| NYSE 9:30 opening range | Session range: first 15-30 min after a session open |
+| Long only | Long and short (spot crypto is long only; futures/CFDs can short) |
+| Whole shares | Coins in fractions (BTC 0.00001) or gold lots (0.01 lot = 1 oz) |
+| Flat by 3:55 PM | Flat before big news, funding, the gold break, or you sleep |
+| Free Yahoo bars | Alpha Vantage live price + bid/ask; range candles from the user's chart |
+| 8-K news | Macro calendar (US data, FOMC), ETF flows, dollar and yields |
+
+## Session clock (all times IST; run `python3 plan.py sessions` for today)
+
+- UTC day open 05:30 - BTC/ETH daily candle resets. Previous-day high/low matter.
+- London open 08:00 UK (about 12:30-13:30 IST) - gold's busiest window starts.
+- US data 08:30 ET (about 18:00-19:00 IST) - CPI, NFP, jobless claims. Gold and BTC spike.
+- US stock open 09:30 ET (about 19:00-20:00 IST) - BTC/ETH often move with Nasdaq.
+- Perp funding 05:30, 13:30, 21:30 IST.
+- Gold: closed from Fri ~17:00 New York to Sun ~17:00; short break daily around 17:00 ET.
+- Daylight saving shifts these by an hour; the script handles it.
+
+## The pipeline (same order as the original pack)
+
+1. **Scan** - Pick ONE asset today. Note previous-day high and low, and the current session's range.
+2. **News** - Check before any entry: is a US data release, FOMC, or big crypto event inside the next 2 hours? If yes, stand aside or be flat before it. Gold also reacts to the dollar (DXY) and US real yields; BTC/ETH to ETF flows and Nasdaq.
+3. **Entry** - Setup A, session range breakout: take the high and low of the first 15-30 min of London or the US open. Enter only on a 5-minute candle that CLOSES beyond the range (long above the high, short below the low), never on a wick. Setup B, previous-day high/low break with the same close rule. Tool: `python3 plan.py range --high H --low L --rr 1.5`.
+4. **Exit plan before entry** - Stop at the range midpoint (or far side of the range for a wider stop). Target at 1R to 2R. Write both down first.
+5. **Replay (time machine, by hand)** - No bar data here, so instead check the last 15-20 sessions on the chart: how many times did this exact rule hit the target before the stop? If the user cannot say, treat the edge as unproven and paper trade it. Do not claim odds Claude cannot compute.
+6. **Size** - `python3 plan.py size --asset btc --side long --entry E --stop S --rr 1.5 --account A --risk R`. It prints size, notional, leverage, loss at stop (fees and spread included), and refuses when the minimum size is too big for the account.
+7. **Risk check** - Block the trade if any of these fail: stop defined; loss at stop <= max loss per trade (1-2% of account, less on a small account); reward:risk net of costs >= 1.2; no more than 3 trades a day; stop for the day after 2 losing trades or a daily loss of 2x the per-trade limit; no trade 30 min before or after major news; leverage <= 3x unless the user knowingly raises it.
+8. **Order** - Claude never places orders. The user places it in their own exchange or broker app, with the stop and target attached as one bracket (or OCO) order. Paper account first.
+9. **Alerts** - On the phone app, Claude can set alarms and timers for session opens, news times and "flat by" times. Ask.
+
+## Live data (Alpha Vantage connector, free key)
+
+Tools may need loading first with ToolSearch ("alpha vantage"). Verified working:
+
+- BTC / ETH price + bid + ask: CURRENCY_EXCHANGE_RATE (from_currency BTC or ETH, to_currency USD, datatype json). On Delta, BTC and ETH are priced in USD; only gold is priced in USDT (Tether). Spread = ask - bid. Pass it to `plan.py size --spread`. plan.py labels money as USD for BTC/ETH and USDT for gold (override with `--quote`).
+- Gold: GOLD_SILVER_SPOT (symbol XAU). Price only, no bid/ask; use the default 0.30 spread unless the user's broker shows another. Frozen on weekends (the price is Friday's last).
+- Not on the free key: CRYPTO_INTRADAY (5-min candles) is premium. Do not promise range data from it. Ask the user for the range high/low from their chart.
+- Possible but untested: DIGITAL_CURRENCY_DAILY / FX_DAILY for previous-day high/low; NONFARM_PAYROLL, CPI, TREASURY_YIELD, DX (dollar index) and NEWS_SENTIMENT for the news step.
+
+Limits that matter:
+- Free key = 25 requests per day and about 1 per second. Never fire two calls in the same turn; send them one at a time. Spend requests only when the user is about to trade or asks, never as background polling.
+- On "rate_limit" or "premium endpoint" errors, say so plainly and fall back to the user's chart price. Never invent a price.
+- Always say when the price was last refreshed (the response gives a UTC time; convert to IST). If it is older than a few minutes, tell the user.
+
+Pre-trade routine with live data: (1) price + spread, (2) user sends range high/low, (3) `plan.py range`, (4) after a 5-min close beyond the range, `plan.py size` with the real entry and `--spread`, (5) risk check, (6) the user places the order in their own app.
+
+## Defaults and facts worth knowing
+
+- Fees are the user's real Delta Exchange rates, set as defaults in plan.py: BTC/ETH maker 0.02%, taker 0.05%; gold 0.01%. The planner assumes entry = taker (breakout on a candle close is a market order), target = maker (limit order), stop = taker. A stop-out costs about 0.10% round trip, a target hit about 0.07%, plus the bid/ask spread. Pass `--fee-pct`, `--fee-entry`, `--fee-target`, `--fee-stop` (percent) if the user's tier changes. Fees are not ignorable: they raise the win rate needed to break even. The planner prints that break-even win rate every time. Rule of thumb from testing at $5 risk: BTC stop under ~0.25% away needs 54-67% wins to break even; 0.5% or wider needs under 47%. Do not take BTC/ETH trades whose break-even win rate is above ~55%.
+- Gold contract size: plan.py models gold as 1 lot = 100 oz. Delta's gold contract size may differ. Ask the user for the contract value before trusting the gold size, and adjust `contract` and `step` in plan.py.
+- Gold: 1 lot = 100 oz, so $1 of gold = $100 per lot. 0.01 lot = 1 oz, about 8x leverage on a $500 account at $4,000 gold. A small account may be unable to trade gold sensibly; the script says so instead of forcing a size.
+- Weekends: BTC/ETH liquidity is thin, moves can be violent and stops can slip. Gold gaps over the weekend.
+- Stops are not guarantees. News spikes can fill well past the stop.
+- Most day traders lose money. The first goal is losing small while learning.
+
+## India notes (verify current rules; this is not legal or tax advice)
+
+- Crypto gains are taxed heavily in India (flat rate, no loss offset, TDS on sales). Check current rules before trading size.
+- Trading XAUUSD margin or CFDs on offshore platforms is generally not allowed for Indian residents under FEMA/RBI rules. Gold exposure through Indian exchanges (MCX gold, gold ETFs, or SEBI-regulated products) is the compliant route. Check with the broker's compliance page.
+
+## Output style
+
+Phone-sized: lead with the verdict (take it, skip it, or refused and why), then the numbers: entry, stop, target, size, loss at stop. One warning at a time, only if it changes the decision.
